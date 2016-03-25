@@ -201,93 +201,6 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       val counters = new CacheCounters().asInput
    }
 
-   if (DECODE_WIDTH == 1)      println("\n   ~*** One-wide Machine ***~\n")
-   else if (DECODE_WIDTH == 2) println("\n   ~*** Two-wide Machine ***~\n")
-   else if (DECODE_WIDTH == 4) println("\n   ~*** Four-wide Machine ***~\n")
-   else                        println("\n ~*** Unknown Machine Width ***~\n")
-
-   require (ISSUE_WIDTH <= 4)
-   if (ISSUE_WIDTH == 1) println("    -== Single Issue ==- \n")
-   if (ISSUE_WIDTH == 2) println("    -== Dual Issue ==- \n")
-   if (ISSUE_WIDTH == 3) println("    -== Triple Issue ==- \n")
-   if (ISSUE_WIDTH == 4) println("    -== Quad Issue ==- \n")
-
-
-   //*******************************
-   // Instantiate the ExecutionUnits
-
-   val exe_units = ArrayBuffer[ExecutionUnit]()
-
-   if (ISSUE_WIDTH == 1)
-   {
-      exe_units += Module(new ALUMemExeUnit(is_branch_unit   = true
-                                          , shares_csr_wport = true
-                                          , fp_mem_support   = usingFPU
-                                          , has_fpu          = usingFPU
-                                          , has_mul          = true
-                                          , has_div          = true
-                                          , use_slow_mul     = false
-                                          , has_fdiv         = usingFPU && usingFDivSqrt
-                                          ))
-   }
-   else if (ISSUE_WIDTH == 2)
-   {
-      exe_units += Module(new ALUExeUnit(is_branch_unit      = true
-                                          , shares_csr_wport = true
-                                          , has_fpu          = usingFPU
-                                          , has_mul          = true
-                                          ))
-      exe_units += Module(new ALUMemExeUnit(fp_mem_support   = usingFPU
-                                          , has_div          = true
-                                          , has_fdiv         = usingFPU && usingFDivSqrt
-                                          ))
-   }
-   else if (ISSUE_WIDTH == 3)
-   {
-      exe_units += Module(new ALUExeUnit(is_branch_unit      = true
-                                          , shares_csr_wport = true
-                                          , has_fpu          = usingFPU
-                                          , has_mul          = true
-                                          ))
-      exe_units += Module(new ALUExeUnit(has_div             = true
-                                          , has_fdiv         = usingFPU && usingFDivSqrt
-                                          ))
-      exe_units += Module(new MemExeUnit())
-   }
-   else
-   {
-      require (ISSUE_WIDTH == 4)
-      exe_units += Module(new ALUExeUnit(is_branch_unit      = false
-                                          , shares_csr_wport = true
-                                          , has_fpu          = usingFPU
-                                          , has_mul          = true
-                                          ))
-      exe_units += Module(new ALUExeUnit(is_branch_unit      = true))
-      exe_units += Module(new ALUExeUnit(has_div             = true
-                                          , has_fdiv         = usingFPU && usingFDivSqrt
-                                          ))
-      exe_units += Module(new MemExeUnit())
-   }
-
-   require (exe_units.length != 0)
-   require (exe_units.map(_.is_mem_unit).reduce(_|_), "Datapath is missing a memory unit.")
-   require (exe_units.map(_.has_mul).reduce(_|_), "Datapath is missing a multiplier.")
-   require (exe_units.map(_.has_div).reduce(_|_), "Datapath is missing a divider.")
-   require (exe_units.map(_.has_fpu).reduce(_|_) == usingFPU, "Datapath is missing a fpu (or has an fpu and shouldnt).")
-
-   val num_rf_read_ports = exe_units.map(_.num_rf_read_ports).reduce[Int](_+_)
-   val num_rf_write_ports = exe_units.map(_.num_rf_write_ports).reduce[Int](_+_)
-   val num_total_bypass_ports = exe_units.withFilter(_.isBypassable).map(_.numBypassPorts).reduce[Int](_+_)
-   val num_fast_wakeup_ports = exe_units.count(_.isBypassable)
-   // TODO reduce the number of slow wakeup ports - currently have every write-port also be a slow-wakeup-port.
-   val num_slow_wakeup_ports = num_rf_write_ports
-   // The slow write ports to the regfile are variable latency, and thus can't be bypassed.
-   // val num_slow_wakeup_ports = exe_units.map(_.num_variable_write_ports).reduce[Int](_+_)
-
-   val num_wakeup_ports = num_slow_wakeup_ports + num_fast_wakeup_ports
-   val rf_cost = (num_rf_read_ports+num_rf_write_ports)*(num_rf_read_ports+2*num_rf_write_ports)
-
-
    //**********************************
    // Pipeline State Registers
    // Forward Declared Wires
@@ -338,17 +251,13 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    val register_width        = if (!usingFPU) xLen else 65
    val bypasses              = Wire(new BypassData(num_total_bypass_ports, register_width))
 
-   val br_unit = Wire(new BranchUnitResp())
-   require (exe_units.count(_.hasBranchUnit) == 1)
-   val brunit_idx = exe_units.indexWhere(_.hasBranchUnit)
-   br_unit <> exe_units(brunit_idx).io.br_unit
+   val br_unit_io = Wire(new BranchUnitResp())
+   br_unit_io <> exe_units.br_unit.io
 
 
    // Memory State
-   var lsu_io:LoadStoreUnitIO = null
-   lsu_io = (exe_units.find(_.is_mem_unit).get).io.lsu_io
-   require (exe_units.count(_.is_mem_unit) == 1) // only one mem_unit supported
-   (exe_units.find(_.is_mem_unit).get).io.dmem <> io.dmem
+   val lsu_io = exe_units.memory_unit.io.lsu_io
+   (exe_units.memory_unit).io.dmem <> io.dmem
 
 
    // Writeback State
@@ -417,7 +326,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    //-------------------------------------------------------------
    //-------------------------------------------------------------
 
-   val kill_frontend = br_unit.brinfo.mispredict || flush_pipeline
+   val kill_frontend = br_unit_io.brinfo.mispredict || flush_pipeline
 
    val fetchbuffer_kill = Wire(Bool())
    val fetch_bundle = Wire(new FetchBundle())
@@ -453,7 +362,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    val if_stalled = Wire(Bool()) // if FetchBuffer backs up, we have to stall the front-end
    if_stalled := !(FetchBuffer.io.enq.ready)
 
-   val take_pc = br_unit.take_pc ||
+   val take_pc = br_unit_io.take_pc ||
                  flush_take_pc ||
                  csr_take_pc ||
                  (bp2_take_pc && !if_stalled) // TODO this seems way too low-level, to get this backpressure signal correct
@@ -466,13 +375,13 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
    if_pc_next :=  Mux(com_exception || csr_take_pc, csr_evec,
                   Mux(flush_take_pc               , flush_pc,
-                  Mux(br_unit.take_pc             , br_unit.target(vaddrBits,0),
+                  Mux(br_unit_io.take_pc             , br_unit_io.target(vaddrBits,0),
                                                     bp2_pred_target))) // bp2_take_pc
 
    // Fetch Buffer
    FetchBuffer.io.enq.valid := io.imem.resp.valid && !fetchbuffer_kill
    FetchBuffer.io.enq.bits  := fetch_bundle
-   fetchbuffer_kill         := br_unit.brinfo.mispredict || com_exception || flush_pipeline || csr_take_pc
+   fetchbuffer_kill         := br_unit_io.brinfo.mispredict || com_exception || flush_pipeline || csr_take_pc
 
    fetch_bundle.pc := io.imem.resp.bits.pc
    fetch_bundle.xcpt_if := io.imem.resp.bits.xcpt_if
@@ -490,8 +399,8 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
    if (p(EnableBTB))
    {
-      io.imem.btb_update.valid := (br_unit.btb_update_valid ||
-                                    (bp2_take_pc && bp2_is_taken && !if_stalled && !br_unit.take_pc)) &&
+      io.imem.btb_update.valid := (br_unit_io.btb_update_valid ||
+                                    (bp2_take_pc && bp2_is_taken && !if_stalled && !br_unit_io.take_pc)) &&
                                   !flush_take_pc &&
                                   !csr_take_pc
    }
@@ -502,18 +411,18 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
    // update the BTB
    // if branch unit mispredicts, instructions in decode are no longer valid
-   io.imem.btb_update.bits.pc         := Mux(br_unit.btb_update_valid, br_unit.btb_update.pc, io.imem.resp.bits.pc)
-   io.imem.btb_update.bits.br_pc      := Mux(br_unit.btb_update_valid, br_unit.btb_update.br_pc, bp2_pc_of_br_inst)
-   io.imem.btb_update.bits.target     := Mux(br_unit.btb_update_valid, br_unit.btb_update.target,
+   io.imem.btb_update.bits.pc         := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.pc, io.imem.resp.bits.pc)
+   io.imem.btb_update.bits.br_pc      := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.br_pc, bp2_pc_of_br_inst)
+   io.imem.btb_update.bits.target     := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.target,
                                                                        bp2_pred_target & SInt(-coreInstBytes))
-   io.imem.btb_update.bits.prediction := Mux(br_unit.btb_update_valid, br_unit.btb_update.prediction, io.imem.btb_resp)
-   io.imem.btb_update.bits.taken      := Mux(br_unit.btb_update_valid, br_unit.btb_update.taken,
+   io.imem.btb_update.bits.prediction := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.prediction, io.imem.btb_resp)
+   io.imem.btb_update.bits.taken      := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.taken,
                                                                        bp2_take_pc && bp2_is_taken && !if_stalled)
-   io.imem.btb_update.bits.isJump     := Mux(br_unit.btb_update_valid, br_unit.btb_update.isJump, bp2_is_jump)
-   io.imem.btb_update.bits.isReturn   := Mux(br_unit.btb_update_valid, br_unit.btb_update.isReturn, Bool(false))
+   io.imem.btb_update.bits.isJump     := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.isJump, bp2_is_jump)
+   io.imem.btb_update.bits.isReturn   := Mux(br_unit_io.btb_update_valid, br_unit_io.btb_update.isReturn, Bool(false))
 
    // TODO need to also update bht_update during bp2 takens, to keep history correct
-   io.imem.bht_update := br_unit.bht_update
+   io.imem.bht_update := br_unit_io.bht_update
 
    io.imem.invalidate := Range(0,DECODE_WIDTH).map{i => com_valids(i) && com_uops(i).is_fencei}.reduce(_|_)
 
@@ -530,7 +439,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    val bpd_stage = Module(new BranchPredictionStage(FETCH_WIDTH))
    bpd_stage.io.imem <> io.imem
    bpd_stage.io.ras_update <> io.imem.ras_update
-   bpd_stage.io.br_unit := br_unit
+   bpd_stage.io.br_unit_io := br_unit_io
    bpd_stage.io.kill := flush_take_pc
    bpd_stage.io.req.ready := !if_stalled
 
@@ -613,7 +522,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
                         || laq_full
                         || stq_full
                         || branch_mask_full(w)
-                        || br_unit.brinfo.mispredict
+                        || br_unit_io.brinfo.mispredict
                         || flush_pipeline
                         || dec_stall_next_inst
                         || !bpd_stage.io.brob.allocate.ready
@@ -659,7 +568,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
    val dec_brmask_logic = Module(new BranchMaskGenerationLogic(DECODE_WIDTH))
 
-   dec_brmask_logic.io.brinfo := br_unit.brinfo
+   dec_brmask_logic.io.brinfo := br_unit_io.brinfo
    dec_brmask_logic.io.flush_pipeline := flush_pipeline
 
    for (w <- 0 until DECODE_WIDTH)
@@ -705,9 +614,9 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    rename_stage.io.ren_pred_info := dec_fbundle.pred_resp
 
    rename_stage.io.kill     := kill_frontend // mispredict or flush
-   rename_stage.io.brinfo   := br_unit.brinfo
-   rename_stage.io.get_pred.br_tag        := iss_uops(brunit_idx).br_tag
-   exe_units(brunit_idx).io.get_pred.info := Reg(next=rename_stage.io.get_pred.info)
+   rename_stage.io.brinfo   := br_unit_io.brinfo
+   rename_stage.io.get_pred.br_tag        := iss_uops(br_unit.idx).br_tag
+   br_unit_io.get_pred.info := Reg(next=rename_stage.io.get_pred.info)
 
    rename_stage.io.flush_pipeline := flush_pipeline
 
@@ -769,7 +678,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       dis_mask(w)         := rename_stage.io.ren_mask(w)
       dis_uops(w)         := rename_stage.io.ren_uops(w)
       // TODO probably don't need to do this, since we're going ot do it in the issue window?
-      dis_uops(w).br_mask := GetNewBrMask(br_unit.brinfo, rename_stage.io.ren_uops(w))
+      dis_uops(w).br_mask := GetNewBrMask(br_unit_io.brinfo, rename_stage.io.ren_uops(w))
 
       // note: this assumes uops haven't been shifted - there's a 1:1 match between PC's LSBs and "w" here
       // (thus the LSB of the rob_idx gives part of the PC)
@@ -831,7 +740,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
 
 
-   issue_unit.io.brinfo := br_unit.brinfo
+   issue_unit.io.brinfo := br_unit_io.brinfo
    issue_unit.io.flush_pipeline := flush_pipeline
 
    wu_idx = 0
@@ -897,7 +806,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       register_read.io.iss_uops(w) := iss_uops(w)
    }
 
-   register_read.io.brinfo := br_unit.brinfo
+   register_read.io.brinfo := br_unit_io.brinfo
    register_read.io.kill   := flush_pipeline
 
    register_read.io.bypass := bypasses
@@ -974,7 +883,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    for (w <- 0 until exe_units.length)
    {
       exe_units(w).io.req <> register_read.io.exe_reqs(w)
-      exe_units(w).io.brinfo := br_unit.brinfo
+      exe_units(w).io.brinfo := br_unit_io.brinfo
       exe_units(w).io.com_handling_exc := com_handling_exc // TODO get rid of this?
 
 
@@ -1018,8 +927,8 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
    lsu_io.exception         := flush_pipeline || lsu_misspec //com_exception comes too early, will fight against a branch that resolves same cycle as an exception
 
    // Handle Branch Mispeculations
-   lsu_io.brinfo      := br_unit.brinfo
-   io.dmem.brinfo     := br_unit.brinfo
+   lsu_io.brinfo      := br_unit_io.brinfo
+   io.dmem.brinfo     := br_unit_io.brinfo
 
 
    laq_full    := lsu_io.laq_full
@@ -1155,15 +1064,15 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       }
 
       // branch resolution
-      rob.io.br_unit <> br_unit.asInput()
+      rob.io.br_unit_io <> br_unit_io.asInput()
 
       // branch unit requests PCs and predictions from ROB during register read
       // (fetch PC from ROB cycle earlier than needed for critical path reasons)
-      rob.io.get_pc.rob_idx := iss_uops(brunit_idx).rob_idx
-      exe_units(brunit_idx).io.get_rob_pc.curr_pc  := Reg(next=rob.io.get_pc.curr_pc)
-      exe_units(brunit_idx).io.get_rob_pc.curr_brob_idx  := Reg(next=rob.io.get_pc.curr_brob_idx)
-      exe_units(brunit_idx).io.get_rob_pc.next_val := Reg(next=rob.io.get_pc.next_val)
-      exe_units(brunit_idx).io.get_rob_pc.next_pc  := Reg(next=rob.io.get_pc.next_pc)
+      rob.io.get_pc.rob_idx := iss_uops(br_unit.idx).rob_idx
+      br_unit_io.get_rob_pc.curr_pc  := Reg(next=rob.io.get_pc.curr_pc)
+      br_unit_io.get_rob_pc.curr_brob_idx  := Reg(next=rob.io.get_pc.curr_brob_idx)
+      br_unit_io.get_rob_pc.next_val := Reg(next=rob.io.get_pc.next_val)
+      br_unit_io.get_rob_pc.next_pc  := Reg(next=rob.io.get_pc.next_pc)
 
       // LSU <> ROB
       lsu_misspec := rob.io.lsu_misspec
@@ -1173,7 +1082,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
       rob.io.cxcpt.valid := csr.io.csr_xcpt
 
-      rob.io.bxcpt <> br_unit.xcpt.asInput()
+      rob.io.bxcpt <> br_unit_io.xcpt.asInput()
 
 
       // Commit (ROB outputs)
@@ -1192,7 +1101,7 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       com_rbk_valids   := rob.io.com_rbk_valids
 
       bpd_stage.io.brob.deallocate <> rob.io.brob_deallocate
-      bpd_stage.io.brob.br_unit <> br_unit.asInput()
+      bpd_stage.io.brob.br_unit_io <> br_unit_io.asInput()
       bpd_stage.io.brob.flush := flush_pipeline || rob.io.flush_brob
 
    //-------------------------------------------------------------
@@ -1220,8 +1129,8 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
       debug(com_uops(w).inst)
       debug(com_valids(w))
    }
-   debug(br_unit.brinfo.valid)
-   debug(br_unit.brinfo.mispredict)
+   debug(br_unit_io.brinfo.valid)
+   debug(br_unit_io.brinfo.mispredict)
 
    // detect pipeline freezes and throw error
    val idle_cycles = rocket.WideCounter(32)
@@ -1268,18 +1177,18 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 //      csr.io.uarch_counters(6)  := branch_mask_full.reduce(_|_)
 //      csr.io.uarch_counters(6)  := io.counters.ic_miss
 //      csr.io.uarch_counters(7)  := io.counters.dc_miss
-      csr.io.uarch_counters(6)  := br_unit.brinfo.valid
-      csr.io.uarch_counters(7)  := br_unit.brinfo.mispredict
+      csr.io.uarch_counters(6)  := br_unit_io.brinfo.valid
+      csr.io.uarch_counters(7)  := br_unit_io.brinfo.mispredict
       csr.io.uarch_counters(8)  := lsu_io.counters.ld_valid
       csr.io.uarch_counters(9)  := lsu_io.counters.ld_forwarded
 //      csr.io.uarch_counters(10) := lsu_io.counters.ld_sleep
 //      csr.io.uarch_counters(10) := lsu_io.counters.ld_killed
       csr.io.uarch_counters(10) := lsu_io.counters.ld_order_fail
-      csr.io.uarch_counters(11) := br_unit.bpd_update.valid // provide base-line on the number of updates, vs mispredicts
-      csr.io.uarch_counters(12) := br_unit.bpd_update.valid && !br_unit.bht_update.bits.mispredict && br_unit.bpd_update.bits.bpd_mispredict // BTB correct, BPD wrong
-      csr.io.uarch_counters(13) := br_unit.bpd_update.valid && br_unit.bht_update.bits.mispredict && !br_unit.bpd_update.bits.bpd_mispredict // BPD correct, BTB wrong
-      csr.io.uarch_counters(14) := br_unit.bpd_update.valid && br_unit.bpd_update.bits.bpd_mispredict // BPD mispredicts
-      csr.io.uarch_counters(15) := br_unit.bht_update.valid && br_unit.bht_update.bits.mispredict // BTB mispredicts
+      csr.io.uarch_counters(11) := br_unit_io.bpd_update.valid // provide base-line on the number of updates, vs mispredicts
+      csr.io.uarch_counters(12) := br_unit_io.bpd_update.valid && !br_unit_io.bht_update.bits.mispredict && br_unit_io.bpd_update.bits.bpd_mispredict // BTB correct, BPD wrong
+      csr.io.uarch_counters(13) := br_unit_io.bpd_update.valid && br_unit_io.bht_update.bits.mispredict && !br_unit_io.bpd_update.bits.bpd_mispredict // BPD correct, BTB wrong
+      csr.io.uarch_counters(14) := br_unit_io.bpd_update.valid && br_unit_io.bpd_update.bits.bpd_mispredict // BPD mispredicts
+      csr.io.uarch_counters(15) := br_unit_io.bht_update.valid && br_unit_io.bht_update.bits.mispredict // BTB mispredicts
 //      csr.io.uarch_counters(14) := PopCount((Range(0,COMMIT_WIDTH)).map{w => com_valids(w) && com_uops(w).is_store})
 //      csr.io.uarch_counters(15) := PopCount((Range(0,COMMIT_WIDTH)).map{w => com_valids(w) && com_uops(w).is_load})
    }
@@ -1320,14 +1229,14 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
          , tsc_reg
          , irt_reg & UInt(0xffffff)
       // Fetch Stage 1
-         , Mux(br_unit.brinfo.valid, Str("V"), Str("-"))
-         , Mux(br_unit.brinfo.taken, Str("T"), Str("-"))
-         , Mux(br_unit.debug_btb_pred, Str("B"), Str("_"))
-         , Mux(br_unit.brinfo.mispredict, Str(b_mgt + "MISPREDICT" + end), Str(grn + "          " + end))
-         , br_unit.brinfo.tag
+         , Mux(br_unit_io.brinfo.valid, Str("V"), Str("-"))
+         , Mux(br_unit_io.brinfo.taken, Str("T"), Str("-"))
+         , Mux(br_unit_io.debug_btb_pred, Str("B"), Str("_"))
+         , Mux(br_unit_io.brinfo.mispredict, Str(b_mgt + "MISPREDICT" + end), Str(grn + "          " + end))
+         , br_unit_io.brinfo.tag
          , Mux(take_pc, Str("TAKE_PC"), Str(" "))
          , Mux(flush_take_pc, Str("FLSH"),
-           Mux(br_unit.take_pc, Str("BRU "),
+           Mux(br_unit_io.take_pc, Str("BRU "),
            Mux(bp2_take_pc && !if_stalled, Str("BP2"),
            Mux(bp2_take_pc, Str("J-s"),
                               Str(" ")))))
@@ -1438,16 +1347,16 @@ class BOOMCore(implicit p: Parameters) extends BoomModule()(p)
 
       // branch unit
       printf("                          Branch Unit: %s,%s,%d PC=0x%x, %d Targ=0x%x NPC=%d,0x%x %d%d\n"
-         , Mux(br_unit.brinfo.valid,Str("V"), Str(" "))
-         , Mux(br_unit.brinfo.mispredict, Str("M"), Str(" "))
-         , br_unit.brinfo.taken
-         , br_unit.btb_update.br_pc(19,0)
-         , br_unit.btb_update_valid
-         , br_unit.btb_update.target(19,0)
-         , exe_units(brunit_idx).io.get_rob_pc.next_val
-         , exe_units(brunit_idx).io.get_rob_pc.next_pc(19,0)
-         , br_unit.btb_update.isJump
-         , br_unit.btb_update.isReturn
+         , Mux(br_unit_io.brinfo.valid,Str("V"), Str(" "))
+         , Mux(br_unit_io.brinfo.mispredict, Str("M"), Str(" "))
+         , br_unit_io.brinfo.taken
+         , br_unit_io.btb_update.br_pc(19,0)
+         , br_unit_io.btb_update_valid
+         , br_unit_io.btb_update.target(19,0)
+         , br_unit_io.get_rob_pc.next_val
+         , br_unit_io.get_rob_pc.next_pc(19,0)
+         , br_unit_io.btb_update.isJump
+         , br_unit_io.btb_update.isReturn
       )
 
       printf("  Mem[%s l%d](%s:%d),%s,%s %s %s %s]\n"
