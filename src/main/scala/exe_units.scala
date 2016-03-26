@@ -3,8 +3,9 @@ package boom
 import Chisel._
 import Node._
 import cde.Parameters
+import scala.collection.mutable.ArrayBuffer
 
-class BoomExeUnits(implicit p: Parameters) extends HasBoomParameters
+class BoomExeUnits(implicit val p: Parameters) extends HasBoomCoreParameters
 {
    if (DECODE_WIDTH == 1)      println("\n   ~*** One-wide Machine ***~\n")
    else if (DECODE_WIDTH == 2) println("\n   ~*** Two-wide Machine ***~\n")
@@ -28,8 +29,11 @@ class BoomExeUnits(implicit p: Parameters) extends HasBoomParameters
 
    def seq = exe_units
    def apply(n: Int) = exe_units(n)
-   def map[T](f: ExecutionUnit => T) {
+   def map[T](f: ExecutionUnit => T) = {
      exe_units.map(f)
+   }
+   def withFilter(f: ExecutionUnit => Boolean) = {
+     exe_units.withFilter(f)
    }
 
    lazy val memory_unit = {
@@ -43,8 +47,8 @@ class BoomExeUnits(implicit p: Parameters) extends HasBoomParameters
      exe_units.find(_.hasBranchUnit).get
    }
 
-   lazy val idx = {
-     exe_units.indexWhere(_.hasBranchUnit).get
+   lazy val brunit_idx = {
+     exe_units.indexWhere(_.hasBranchUnit)
    }
 
    def length = exe_units.length
