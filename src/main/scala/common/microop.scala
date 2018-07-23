@@ -120,6 +120,9 @@ class MicroOp(implicit p: Parameters) extends BoomBundle()(p)
    val replay_if        = Bool()             // I$ wants us to replay our ifetch request
    val xcpt_ma_if       = Bool()             // Misaligned fetch (jal/brjumping to misaligned addr).
 
+   // ordering version
+   val version          = UInt(width=32)
+
    // purely debug information
    val debug_wdata      = UInt(xLen.W)
    val debug_events     = new DebugStageEvents

@@ -55,6 +55,8 @@ import boom.common._
 import boom.exu.{BrResolutionInfo, Exception, FlushSignals, FuncUnitResp}
 import boom.util.{AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc}
 
+import chisel3.experimental.dontTouch
+
 class LoadStoreUnitIO(pl_width: Int)(implicit p: Parameters) extends BoomBundle()(p)
 {
    // Decode Stage
@@ -193,10 +195,9 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    val stq_uop       = Reg(Vec(num_st_entries, new MicroOp()))
    // TODO not convinced I actually need stq_entry_val; I think other ctrl signals gate this off
    val stq_entry_val = Reg(Vec(num_st_entries, Bool())) // this may be valid, but not TRUE (on exceptions, this doesn't get cleared but STQ_TAIL gets moved)
-   val stq_executed  = Reg(Vec(num_st_entries, Bool())) // sent to mem
-   val stq_succeeded = Reg(Vec(num_st_entries, Bool())) // returned TODO is this needed, or can we just advance the stq_head?
-   val stq_committed = Reg(Vec(num_st_entries, Bool())) // the ROB has committed us, so we can now send our store to memory
-
+   val stq_executed  = Reg(init = Vec.fill(num_st_entries) { Bool(false) }) // sent to mem
+   val stq_succeeded = Reg(init = Vec.fill(num_st_entries) { Bool(false) }) // returned TODO is this needed, or can we just advance the stq_head?
+   val stq_committed = Reg(init = Vec.fill(num_st_entries) { Bool(false) }) // the ROB has committed us, so we can now send our store to memory
 
    val laq_head = Reg(UInt())
    val laq_tail = Reg(UInt()) // point to next available (or if full, the laq_head entry).
@@ -231,6 +232,8 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
 
    var ld_enq_idx = laq_tail
    var st_enq_idx = stq_tail
+   val fence_counter = RegInit(0.U(32.W))
+   dontTouch(fence_counter)
 
    for (w <- 0 until pl_width)
    {
@@ -489,23 +492,46 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
 
 
    // *** STORES ***
+   // find a store to send to memory
 
-   when (stq_entry_val(stq_execute_head) &&
-         (stq_committed(stq_execute_head) ||
-            (stq_uop(stq_execute_head).is_amo &&
-            saq_val(stq_execute_head) &&
-            !saq_is_virtual(stq_execute_head) &&
-            sdq_val(stq_execute_head)
-            )) &&
-         !stq_executed(stq_execute_head) &&
-         !stq_uop(stq_execute_head).is_fence &&
-         !mem_xcpt_valid &&
-         !stq_uop(stq_execute_head).exception
-   )
+   val store_fire_vec = Wire(Vec(num_st_entries, Bool()))
+   val last_fired_store_version = Reg(init = UInt(0))
+   for (i <- 0 until num_st_entries)
    {
-      can_fire_store_commit := true.B
+      when (stq_entry_val(i) &&
+            (stq_committed(i) ||
+            (stq_uop(i).is_amo &&
+               saq_val(i) &&
+               !saq_is_virtual(i) &&
+               sdq_val(i)
+            )) &&
+         !stq_executed(i) &&
+         !(stq_uop(i).is_fence) &&
+         (io.dmem_is_ordered || (last_fired_store_version <= stq_uop(i).version)))
+      {
+         store_fire_vec(i) := Bool(true)
+      }.otherwise
+      {
+         store_fire_vec(i) := Bool(false)
+      }
    }
 
+   val shift_vec = Wire(UInt(width=num_st_entries))
+   shift_vec := Fill(num_st_entries, 1.U(1.W)) << stq_head
+   val store_fire_bits = store_fire_vec.asUInt
+   // val store_fire_bits_shifted = store_fire_bits // (store_fire_bits >> stq_execute_head) | (store_fire_bits << (num_st_entries - stq_execute_head))
+   val store_fire_bits_shifted = store_fire_bits & shift_vec // (store_fire_bits >> stq_execute_head) | (store_fire_bits << (num_st_entries - stq_execute_head))
+   val store_fire_idx = Wire(UInt(width=log2Ceil(num_st_entries)))
+   when (store_fire_bits_shifted.orR)
+   {
+     store_fire_idx := PriorityEncoder(store_fire_bits_shifted) // + stq_execute_head
+   }.otherwise
+   {
+      store_fire_idx := PriorityEncoder(store_fire_bits)
+   }
+   dontTouch(store_fire_idx)
+
+   can_fire_store_commit := store_fire_bits.orR
    stq_retry_idx := stq_commit_head
 
    when (stq_entry_val (stq_retry_idx) &&
@@ -517,11 +543,12 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    }
 
 
-   assert (!(can_fire_store_commit && saq_is_virtual(stq_execute_head)),
+   assert (!(can_fire_store_commit && saq_is_virtual(store_fire_idx)),
             "a committed store is trying to fire to memory that has a bad paddr.")
 
-   assert (stq_entry_val(stq_execute_head) ||
-            stq_head === stq_execute_head || stq_tail === stq_execute_head,
+   val stq_consistent = Wire(Bool())
+   stq_consistent := stq_entry_val(stq_execute_head) || (stq_head === stq_execute_head) || (stq_tail === stq_execute_head)
+   assert (stq_consistent,
             "stq_execute_head got off track.")
 
    //-------------------------
@@ -538,23 +565,23 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    // defaults
    io.memreq_val     := false.B
    io.memreq_addr    := exe_ld_addr
-   io.memreq_wdata   := sdq_data(stq_execute_head)
+   io.memreq_wdata   := sdq_data(store_fire_idx)
    io.memreq_uop     := exe_ld_uop
 
    val mem_fired_st = RegInit(false.B)
    mem_fired_st := false.B
    when (will_fire_store_commit)
    {
-      io.memreq_addr  := saq_addr(stq_execute_head)
-      io.memreq_uop   := stq_uop (stq_execute_head)
+      io.memreq_addr  := saq_addr(store_fire_idx)
+      io.memreq_uop   := stq_uop (store_fire_idx)
 
       // prevent this store going out if an earlier store just got nacked!
       when (!(io.nack.valid && !io.nack.isload))
       {
          io.memreq_val   := true.B
          stq_executed(stq_execute_head) := true.B
-         stq_execute_head := WrapInc(stq_execute_head, num_st_entries)
          mem_fired_st := true.B
+         last_fired_store_version := stq_uop(store_fire_idx).version
       }
    }
    .elsewhen (will_fire_load_incoming || will_fire_load_retry || will_fire_load_wakeup)
@@ -571,7 +598,10 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    assert (PopCount(VecInit(will_fire_store_commit, will_fire_load_incoming, will_fire_load_retry, will_fire_load_wakeup))
       <= 1.U, "Multiple requestors firing to the data cache.")
 
-
+   when (stq_executed(stq_execute_head))
+   {
+      stq_execute_head := WrapInc(stq_execute_head, num_st_entries)
+   }
 
 
    //-------------------------------------------------------------
@@ -1126,6 +1156,11 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
       when (io.commit_store_mask(w))
       {
          stq_committed(temp_stq_commit_head) := true.B
+         stq_uop(temp_stq_commit_head).version := fence_counter
+         when (stq_uop(temp_stq_commit_head).is_fence)
+         {
+            fence_counter := fence_counter + 1.U
+         }
       }
 
       temp_stq_commit_head = Mux(io.commit_store_mask(w),
@@ -1138,8 +1173,7 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    // store has been committed AND successfully sent data to memory
    when (stq_entry_val(stq_head) && stq_committed(stq_head))
    {
-      clear_store := Mux(stq_uop(stq_head).is_fence, io.dmem_is_ordered,
-                                                     stq_succeeded(stq_head))
+      clear_store := stq_uop(stq_head).is_fence | stq_succeeded(stq_head)
    }
 
    when (clear_store)
@@ -1165,9 +1199,9 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
       val idx = temp_laq_head
       when (io.commit_load_mask(w))
       {
-         assert (laq_allocated(idx), "[lsu] trying to commit an un-allocated load entry.")
-         assert (laq_executed(idx), "[lsu] trying to commit an un-executed load entry.")
-         assert (laq_succeeded(idx), "[lsu] trying to commit an un-succeeded load entry.")
+         assert (laq_allocated(idx), "[lsu %d] trying to commit an un-allocated load entry.", idx)
+         assert (laq_executed(idx), "[lsu %d] trying to commit an un-executed load entry.", idx)
+         assert (laq_succeeded(idx), "[lsu %d] trying to commit an un-succeeded load entry.", idx)
 
          laq_allocated(idx)         := false.B
          laq_addr_val (idx)         := false.B
@@ -1206,10 +1240,12 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
       when (!io.nack.isload)
       {
          stq_executed(io.nack.lsu_idx) := false.B
+         /*
          when (IsOlder(io.nack.lsu_idx, stq_execute_head, stq_tail))
          {
             stq_execute_head := io.nack.lsu_idx
          }
+          */
       }
       // the nackee is a load
       .otherwise
