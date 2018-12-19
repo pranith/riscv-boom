@@ -522,16 +522,24 @@ class LoadStoreUnit(pl_width: Int)(implicit p: Parameters, edge: freechips.rocke
    // val store_fire_bits_shifted = store_fire_bits // (store_fire_bits >> stq_execute_head) | (store_fire_bits << (num_st_entries - stq_execute_head))
    val store_fire_bits_shifted = store_fire_bits & shift_vec // (store_fire_bits >> stq_execute_head) | (store_fire_bits << (num_st_entries - stq_execute_head))
    val store_fire_idx = Wire(UInt(width=log2Ceil(num_st_entries)))
-   when (store_fire_bits_shifted.orR)
-   {
-     store_fire_idx := PriorityEncoder(store_fire_bits_shifted) // + stq_execute_head
-   }.otherwise
-   {
-      store_fire_idx := PriorityEncoder(store_fire_bits)
+   if (useVersions) {
+      when (store_fire_bits_shifted.orR)
+      {
+         store_fire_idx := PriorityEncoder(store_fire_bits_shifted) // + stq_execute_head
+      }.otherwise
+      {
+         store_fire_idx := PriorityEncoder(store_fire_bits)
+      }
+   } else {
+      store_fire_idx := stq_execute_head;
    }
    dontTouch(store_fire_idx)
 
-   can_fire_store_commit := store_fire_bits.orR
+   if (useVersions) {
+      can_fire_store_commit := store_fire_bits.orR
+   } else {
+      can_fire_store_commit := store_fire_bits(stq_execute_head)
+   }
    stq_retry_idx := stq_commit_head
 
    when (stq_entry_val (stq_retry_idx) &&
