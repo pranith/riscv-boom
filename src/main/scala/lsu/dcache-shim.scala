@@ -158,7 +158,7 @@ class DCacheResp(implicit p: Parameters) extends BoomBundle()(p)
    val data         = Bits(coreDataBits.W)
    val data_subword = Bits(coreDataBits.W)
    val uop          = new MicroOp
-   val size         = UInt(2.W)
+   val typ          = Bits(freechips.rocketchip.rocket.MT_SZ.W)
 }
 
 /**
@@ -295,12 +295,11 @@ class DCacheShim(implicit p: Parameters) extends BoomModule()(p)
 
    // delay store data a cycle (that's what the D$ wants).
    val s1_stdata = RegNext(new freechips.rocketchip.rocket.StoreGen(
-      io.core.req.bits.uop.mem_size, 0.U, io.core.req.bits.data, coreDataBytes).data)
+      io.core.req.bits.uop.mem_typ, 0.U, io.core.req.bits.data, coreDataBytes).data)
 
    io.core.req.ready      := enq_rdy && io.dmem.req.ready
    io.dmem.req.valid      := io.core.req.valid
-   io.dmem.req.bits.size  := io.core.req.bits.uop.mem_size
-   io.dmem.req.bits.signed:= io.core.req.bits.uop.mem_signed
+   io.dmem.req.bits.typ   := io.core.req.bits.uop.mem_typ
    io.dmem.req.bits.addr  := io.core.req.bits.addr
    io.dmem.req.bits.tag   := new_inflight_tag
    io.dmem.req.bits.cmd   := Mux(io.core.req.valid, io.core.req.bits.uop.mem_cmd, M_PFW)
@@ -341,7 +340,7 @@ class DCacheShim(implicit p: Parameters) extends BoomModule()(p)
    // TODO change resp bundle to match the new hellacache resp bundle
    io.core.resp.bits.data_subword := io.dmem.resp.bits.data
    io.core.resp.bits.data         := io.dmem.resp.bits.data_word_bypass
-   io.core.resp.bits.size         := io.dmem.resp.bits.size
+   io.core.resp.bits.typ          := io.dmem.resp.bits.typ
 
    //------------------------------------------------------------
    // handle nacks from the cache (or from the IFLB or the LSU)

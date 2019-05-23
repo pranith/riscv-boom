@@ -123,7 +123,7 @@ class ExecutionUnitIO(
  * @param dataWidth width of the data coming out of the exe unit
  * @param bypassable is the exe unit able to be bypassed
  * @param hasMem does the exe unit have a MemAddrCalcUnit
- * @param hasCSR does the exe unit write to the CSRFile
+ * @param usesCsrWport does the exe unit write to the CSRFile
  * @param hasBrUnit does the exe unit have a branch unit
  * @param hasAlu does the exe unit have a alu
  * @param hasFpu does the exe unit have a fpu
@@ -145,7 +145,7 @@ abstract class ExecutionUnit(
   val bypassable       : Boolean       = false, // TODO make override def for code clarity
   val alwaysBypassable : Boolean       = false,
   val hasMem           : Boolean       = false,
-  val hasCSR           : Boolean       = false,
+  val usesCsrWport     : Boolean       = false,
   val hasBrUnit        : Boolean       = false,
   val hasAlu           : Boolean       = false,
   val hasFpu           : Boolean       = false,
@@ -183,7 +183,7 @@ abstract class ExecutionUnit(
       mem = hasMem,
       muld = hasMul || hasDiv,
       fpu = hasFpu,
-      csr = hasCSR,
+      csr = usesCsrWport,
       fdiv = hasFdiv,
       ifpu = hasIfpu)
   }
@@ -194,7 +194,7 @@ abstract class ExecutionUnit(
  * and memory unit.
  *
  * @param hasBrUnit does the exe unit have a branch unit
- * @param hasCSR does the exe unit write to the CSRFile
+ * @param sharesCsrWport does the exe unit write to the CSRFile
  * @param hasAlu does the exe unit have a alu
  * @param hasMul does the exe unit have a multiplier
  * @param hasDiv does the exe unit have a divider
@@ -203,7 +203,7 @@ abstract class ExecutionUnit(
  */
 class ALUExeUnit(
   hasBrUnit      : Boolean = false,
-  hasCSR         : Boolean = false,
+  sharesCsrWport : Boolean = false,
   hasAlu         : Boolean = true,
   hasMul         : Boolean = false,
   hasDiv         : Boolean = false,
@@ -222,7 +222,7 @@ class ALUExeUnit(
     dataWidth        = p(tile.XLen) + 1,
     bypassable       = hasAlu,
     alwaysBypassable = hasAlu && !hasMul && !hasDiv,
-    hasCSR           = hasCSR,
+    usesCsrWport     = sharesCsrWport,
     hasBrUnit        = hasBrUnit,
     hasAlu           = hasAlu,
     hasMul           = hasMul,
@@ -232,7 +232,7 @@ class ALUExeUnit(
     hasRocc          = hasRocc)
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
 {
-  require(!(hasRocc && !hasCSR),
+  require(!(hasRocc && !sharesCsrWport),
     "RoCC needs to be shared with CSR unit")
   require(!(hasMem && hasRocc),
     "We do not support execution unit with both Mem and Rocc writebacks")
@@ -260,7 +260,7 @@ class ALUExeUnit(
   io.fu_types := Mux(hasAlu.B, FU_ALU, 0.U) |
                  Mux(hasMul.B, FU_MUL, 0.U) |
                  Mux(!div_busy && hasDiv.B, FU_DIV, 0.U) |
-                 Mux(hasCSR.B, FU_CSR, 0.U) |
+                 Mux(sharesCsrWport.B, FU_CSR, 0.U) |
                  Mux(hasBrUnit.B, FU_BRU, 0.U) |
                  Mux(!ifpu_busy && hasIfpu.B, FU_I2F, 0.U) |
                  Mux(hasMem.B, FU_MEM, 0.U)

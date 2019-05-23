@@ -26,7 +26,6 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
-import freechips.rocketchip.diplomaticobjectmodel.logicaltree.{ICacheLogicalTreeNode}
 
 import boom.bpu._
 import boom.common._
@@ -335,9 +334,6 @@ trait HasBoomICacheFrontend extends CanHaveBoomPTW
   connectTLSlave(frontend.slaveNode, tileParams.core.fetchBytes)
   nPTWPorts += 1
   nPTWPorts += 1 // boom -- needs an extra PTW port for its LSU.
-
-  val iCacheLogicalTreeNode = new ICacheLogicalTreeNode(frontend.icache.device, tileParams.icache.get)
-
 }
 
 /**
