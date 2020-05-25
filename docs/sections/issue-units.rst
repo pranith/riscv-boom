@@ -2,7 +2,7 @@ The Issue Unit
 ==============
 
 The **Issue Queue** s hold dispatched :term:`Micro-Ops (UOPs) <Micro-Op (UOP)>` that have not yet executed.
-When all of the operands for the :term:`UOP<Micro-Op (UOP)` are ready, the issue slot sets
+When all of the operands for the :term:`UOP <Micro-Op (UOP)>` are ready, the issue slot sets
 its "request" bit high. The issue select logic then chooses to issue a
 slot which is asserting its "request" signal. Once a :term:`UOP<Micro-Op (UOP)` is issued,
 it is removed from the Issue Queue to make room for more dispatched
