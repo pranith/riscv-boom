@@ -105,6 +105,8 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
                                                      // drain, clear fetcha fter it (tell ROB to un-ready until empty)
   val flush_on_commit  = Bool()                      // some instructions need to flush the pipeline behind them
 
+  //Ordering Version
+  val version           = UInt(32.W)
   // Preditation
   def is_sfb_br        = is_br && is_sfb && enableSFBOpt.B // Does this write a predicate
   def is_sfb_shadow    = !is_br && is_sfb && enableSFBOpt.B // Is this predicated

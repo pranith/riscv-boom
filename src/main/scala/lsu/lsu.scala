@@ -53,7 +53,7 @@ import freechips.rocketchip.util.Str
 
 import boom.common._
 import boom.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
-import boom.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
+import boom.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, WrapAdd , IsOlder, UpdateBrMask}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -195,9 +195,10 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val data                = Valid(UInt(xLen.W))
 
+  val fired               = Bool() // D$ req sent
   val committed           = Bool() // committed by ROB
   val succeeded           = Bool() // D$ has ack'd this, we don't need to maintain this anymore
-
+  //val nacked              = Bool() //was this entry nacked in the previous cycle
   val debug_wb_data       = UInt(xLen.W)
 }
 
@@ -211,6 +212,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
 
 
+  val min_store_version = Reg(UInt(32.W))
+  dontTouch(min_store_version)
 
   val ldq_head         = Reg(UInt(ldqAddrSz.W))
   val ldq_tail         = Reg(UInt(ldqAddrSz.W))
@@ -219,13 +222,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
 
-
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
-  assert (io.core.brupdate.b2.mispredict ||
+ /* assert (io.core.brupdate.b2.mispredict ||
           stq(stq_execute_head).valid ||
           stq_head === stq_execute_head ||
           stq_tail === stq_execute_head,
-            "stq_execute_head got off track.")
+            "stq_execute_head got off track.")*/
 
   val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_wait :: h_replay :: h_dead :: Nil = Enum(7)
   // s1 : do TLB, if success and not killed, fire request go to h_s2
@@ -278,7 +280,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(i).bits.st_dep_mask := ldq(i).bits.st_dep_mask & ~(1.U << stq_head)
     }
   }
-
+  val fence_counter = RegInit(0.U(32.W))
+  dontTouch(fence_counter)
+  val prev_inst = RegInit(0.U(32.W))
+  val prev_pc_lob = RegInit(0.U(32.W))
+  val prev_stq_idx = RegInit(0.U(32.W))
   // Decode stage
   var ld_enq_idx = ldq_tail
   var st_enq_idx = stq_tail
@@ -300,6 +306,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     val dis_ld_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
+
     when (dis_ld_val)
     {
       ldq(ld_enq_idx).valid                := true.B
@@ -316,6 +323,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       assert (ld_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
       assert (!ldq(ld_enq_idx).valid, "[lsu] Enqueuing uop is overwriting ldq entries")
+      //asign version
+      ldq(ld_enq_idx).bits.uop.version := fence_counter
     }
       .elsewhen (dis_st_val)
     {
@@ -328,6 +337,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       assert (st_enq_idx === io.core.dis_uops(w).bits.stq_idx, "[lsu] mismatch enq store tag.")
       assert (!stq(st_enq_idx).valid, "[lsu] Enqueuing uop is overwriting stq entries")
+
+      // assign version
+      stq(st_enq_idx).bits.uop.version := fence_counter
+      // increment store version
+      when (stq(st_enq_idx).bits.uop.is_fence && ((stq(st_enq_idx).bits.uop.inst!=prev_inst && stq(st_enq_idx).bits.uop.pc_lob!=prev_pc_lob) || (st_enq_idx != prev_stq_idx))){
+      fence_counter := fence_counter +1.U
+      prev_inst := stq(st_enq_idx).bits.uop.inst
+      prev_pc_lob:= stq(st_enq_idx).bits.uop.pc_lob
+      prev_stq_idx := st_enq_idx
+      }
     }
 
     ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, numLdqEntries),
@@ -484,17 +503,55 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                                  can_fire_std_incoming(i) &&
                                                  stq_incoming_idx(i) === stq_retry_idx).reduce(_||_))
                                ))
+
   // Can we commit a store
-  val can_fire_store_commit  = widthMap(w =>
-                               ( stq_commit_e.valid                           &&
-                                !stq_commit_e.bits.uop.is_fence               &&
-                                !mem_xcpt_valid                               &&
-                                !stq_commit_e.bits.uop.exception              &&
-                                (w == 0).B                                    &&
-                                (stq_commit_e.bits.committed || ( stq_commit_e.bits.uop.is_amo      &&
-                                                                  stq_commit_e.bits.addr.valid      &&
-                                                                 !stq_commit_e.bits.addr_is_virtual &&
-                                                                  stq_commit_e.bits.data.valid))))
+  val store_fire_vec = Wire(Vec(numStqEntries, Bool()))
+  val store_fire_vec_nacked = Wire(Vec(numStqEntries, Bool()))
+  val nacked = Wire(Vec(numStqEntries, Bool()))
+  val last_fired_store_version = RegInit(0.U)
+  for (i <- 0 until numStqEntries)
+  {
+    store_fire_vec(i) :=       ( stq(i).valid                                           &&
+                                !stq(i).bits.uop.is_fence                               &&
+                                !mem_xcpt_valid                                         &&
+                                !stq(i).bits.uop.exception                              &&
+                                !stq(i).bits.succeeded                                  &&
+                                (stq(i).bits.committed || ( stq(i).bits.uop.is_amo      &&
+                                                            stq(i).bits.addr.valid      &&
+                                                           !stq(i).bits.addr_is_virtual &&
+                                                            stq(i).bits.data.valid)     &&
+                                   !stq(i).bits.fired           &&
+                last_fired_store_version <= stq(i).bits.uop.version))
+
+    store_fire_vec_nacked(i) := store_fire_vec(i) && ~nacked(i)
+    nacked(i) := false.B
+  }
+
+  val store_fire_bits = Wire(UInt(numStqEntries.W))
+  when(!store_fire_vec_nacked.asUInt.orR)
+  {
+    store_fire_bits := store_fire_vec.asUInt
+  }.otherwise{
+    store_fire_bits := store_fire_vec_nacked.asUInt
+  }
+
+  val shift_vec_left  = Wire(UInt(numStqEntries.W))
+  val shift_vec_right = Wire(UInt(numStqEntries.W))
+  shift_vec_left  := store_fire_bits >> stq_head
+  shift_vec_right := store_fire_bits << (numStqEntries.asUInt - stq_head.asUInt)
+  val store_fire_bits_shifted = shift_vec_left | shift_vec_right
+  val store_fire_idx = Wire(UInt(log2Ceil(numStqEntries).W))
+
+  when (store_fire_bits_shifted.orR)
+  {
+    store_fire_idx := WrapAdd(PriorityEncoder(store_fire_bits_shifted),stq_head.asUInt,numStqEntries)
+  }.otherwise
+  {
+    store_fire_idx := PriorityEncoder(store_fire_bits)
+  }
+  dontTouch(store_fire_idx)
+  val can_fire_store_commit = WireInit(widthMap(w => false.B))
+  can_fire_store_commit(0) := store_fire_bits.orR
 
   // Can we wakeup a load that was nack'd
   val block_load_wakeup = WireInit(false.B)
@@ -779,18 +836,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       assert(!ldq_retry_e.bits.executed)
     } .elsewhen (will_fire_store_commit(w)) {
       dmem_req(w).valid         := true.B
-      dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
+      dmem_req(w).bits.addr     := stq(store_fire_idx).bits.addr.bits
       dmem_req(w).bits.data     := (new freechips.rocketchip.rocket.StoreGen(
-                                    stq_commit_e.bits.uop.mem_size, 0.U,
-                                    stq_commit_e.bits.data.bits,
+                                    stq(store_fire_idx).bits.uop.mem_size, 0.U,
+                                    stq(store_fire_idx).bits.data.bits,
                                     coreDataBytes)).data
-      dmem_req(w).bits.uop      := stq_commit_e.bits.uop
-
-      stq_execute_head                     := Mux(dmem_req_fire(w),
-                                                WrapInc(stq_execute_head, numStqEntries),
-                                                stq_execute_head)
-
-      stq(stq_execute_head).bits.succeeded := false.B
+      dmem_req(w).bits.uop      := stq(store_fire_idx).bits.uop
+      stq_execute_head          := Mux(dmem_req_fire(w),
+                                       WrapInc(stq_execute_head, numStqEntries),
+                                               stq_execute_head)
+      //change to store_fire_idx
+      stq(store_fire_idx).bits.succeeded := false.B
+      stq(store_fire_idx).bits.fired     := true.B
+      last_fired_store_version           := stq(store_fire_idx).bits.uop.version
     } .elsewhen (will_fire_load_wakeup(w)) {
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
@@ -830,6 +888,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.is_hella       := true.B
     }
 
+    when (stq(stq_execute_head).bits.fired){
+      stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
+    }
     //-------------------------------------------------------------
     // Write Addr into the LAQ/SAQ
     when (will_fire_load_incoming(w) || will_fire_load_retry(w))
@@ -1299,6 +1360,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)) {
           stq_execute_head := io.dmem.nack(w).bits.uop.stq_idx
         }
+        // update nack idx
+        nacked(io.dmem.nack(w).bits.uop.stq_idx) := true.B
+        stq(io.dmem.nack(w).bits.uop.stq_idx).bits.fired := false.B
+        last_fired_store_version := stq(io.dmem.nack(w).bits.uop.stq_idx).bits.uop.version  
       }
     }
     // Handle the response
@@ -1406,10 +1471,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       when (IsKilledByBranch(io.core.brupdate, stq(i).bits.uop))
       {
+
+        //version restore on branch mispredict
+        when(stq(i).bits.uop.is_fence){
+          fence_counter := stq(i).bits.uop.version
+        }
         stq(i).valid           := false.B
         stq(i).bits.addr.valid := false.B
         stq(i).bits.data.valid := false.B
         st_brkilled_mask(i)    := true.B
+	stq(i).bits.fired      := false.B
       }
     }
 
@@ -1446,10 +1517,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   var temp_stq_commit_head = stq_commit_head
   var temp_ldq_head        = ldq_head
+  min_store_version := stq(stq_head).bits.uop.version
   for (w <- 0 until coreWidth)
   {
     val commit_store = io.core.commit.valids(w) && io.core.commit.uops(w).uses_stq
-    val commit_load  = io.core.commit.valids(w) && io.core.commit.uops(w).uses_ldq
+    val commit_load  = io.core.commit.valids(w) && io.core.commit.uops(w).uses_ldq && ((ldq(temp_ldq_head).bits.uop.version <= min_store_version)|| !stq_nonempty)
     val idx = Mux(commit_store, temp_stq_commit_head, temp_ldq_head)
     when (commit_store)
     {
@@ -1493,17 +1565,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // store has been committed AND successfully sent data to memory
   when (stq(stq_head).valid && stq(stq_head).bits.committed)
   {
-    when (stq(stq_head).bits.uop.is_fence && !io.dmem.ordered) {
-      io.dmem.force_order := true.B
-      store_needs_order   := true.B
-    }
-    clear_store := Mux(stq(stq_head).bits.uop.is_fence, io.dmem.ordered,
-                                                        stq(stq_head).bits.succeeded)
+    // TODO: do we need to remove this now?
+    //when (stq(stq_head).bits.uop.is_fence && !io.dmem.ordered) {
+      //io.dmem.force_order := true.B
+      //store_needs_order   := true.B
+    //}
+    clear_store := stq(stq_head).bits.uop.is_fence || stq(stq_head).bits.succeeded
   }
 
   when (clear_store)
   {
     stq(stq_head).valid           := false.B
+    stq(stq_head).bits.fired      := false.B
     stq(stq_head).bits.addr.valid := false.B
     stq(stq_head).bits.data.valid := false.B
     stq(stq_head).bits.succeeded  := false.B
