@@ -593,21 +593,14 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
 
   //-------------------------------------------------------------
 
-  io.deq.uop := uop
-  //Changes Cs 7290
-  //if instrcution is fence, increment version
-  val fence_counter = RegInit(0.U(32.W))
-  dontTouch(fence_counter)
-  val prev_inst = RegInit(0.U(32.W))
-  val prev_pc_lob = RegInit(0.U(32.W))
-  uop.version := fence_counter
-
-  when (uop.is_fence && uop.inst!=prev_inst && uop.pc_lob!=prev_pc_lob){
-    fence_counter := fence_counter +1.U
-    prev_inst := uop.inst
-    prev_pc_lob:= uop.pc_lob
+  val fence_counter = RegInit(0.U(64.W))
+  // if instruction is fence, increment version
+  when (uop.is_fence) {
+    fence_counter := RegNext(fence_counter + 1.U)
   }
 
+  uop.version := fence_counter
+  io.deq.uop := uop
 }
 
 /**

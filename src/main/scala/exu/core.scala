@@ -560,7 +560,9 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   dec_xcpts := dec_uops zip dec_valids map {case (u,v) => u.exception && v}
   val dec_xcpt_stall = dec_xcpts.reduce(_||_) && !xcpt_pc_req.ready
   // stall fetch/dcode because we ran out of branch tags
-  val branch_mask_full = Wire(Vec(coreWidth, Bool()))
+  val branch_mask_full   = Wire(Vec(coreWidth, Bool()))
+  // stall fetch/dcode because we ran out of fence version tags
+  val fversion_mask_full = Wire(Vec(coreWidth, Bool()))
 
   val dec_hazards = (0 until coreWidth).map(w =>
                       dec_valids(w) &&
@@ -568,6 +570,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                       || rob.io.commit.rollback
                       || dec_xcpt_stall
                       || branch_mask_full(w)
+                      || fversion_mask_full(w)
                       || brupdate.b1.mispredict_mask =/= 0.U
                       || brupdate.b2.mispredict
                       || io.ifu.redirect_flush))
@@ -599,6 +602,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   }
 
   branch_mask_full := dec_brmask_logic.io.is_full
+  fversion_mask_full := dec_brmask_logic.io.fversion_is_full
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------

@@ -211,10 +211,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
 
-
-  val min_store_version = Reg(UInt(32.W))
-  dontTouch(min_store_version)
-
   val ldq_head         = Reg(UInt(ldqAddrSz.W))
   val ldq_tail         = Reg(UInt(ldqAddrSz.W))
   val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
@@ -280,11 +276,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(i).bits.st_dep_mask := ldq(i).bits.st_dep_mask & ~(1.U << stq_head)
     }
   }
-  val fence_counter = RegInit(0.U(32.W))
+  val fence_counter = RegInit(0.U(64.W))
   dontTouch(fence_counter)
-  val prev_inst = RegInit(0.U(32.W))
-  val prev_pc_lob = RegInit(0.U(32.W))
   val prev_stq_idx = RegInit(0.U(32.W))
+
   // Decode stage
   var ld_enq_idx = ldq_tail
   var st_enq_idx = stq_tail
@@ -338,14 +333,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       assert (st_enq_idx === io.core.dis_uops(w).bits.stq_idx, "[lsu] mismatch enq store tag.")
       assert (!stq(st_enq_idx).valid, "[lsu] Enqueuing uop is overwriting stq entries")
 
-      // assign version
-      stq(st_enq_idx).bits.uop.version := fence_counter
-      // increment store version
-      when (stq(st_enq_idx).bits.uop.is_fence && ((stq(st_enq_idx).bits.uop.inst!=prev_inst && stq(st_enq_idx).bits.uop.pc_lob!=prev_pc_lob) || (st_enq_idx != prev_stq_idx))){
-      fence_counter := fence_counter +1.U
-      prev_inst := stq(st_enq_idx).bits.uop.inst
-      prev_pc_lob:= stq(st_enq_idx).bits.uop.pc_lob
-      prev_stq_idx := st_enq_idx
+      // update store version to the fence version
+      when (stq(st_enq_idx).bits.uop.is_fence) {
+        fence_counter := stq(st_enq_idx).bits.uop.version
       }
     }
 
@@ -509,6 +499,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val store_fire_vec_nacked = Wire(Vec(numStqEntries, Bool()))
   val nacked = Wire(Vec(numStqEntries, Bool()))
   val last_fired_store_version = RegInit(0.U)
+  val current_fired_store_version = RegInit(0.U)
+  val nack_store_version = RegInit(0.U)
+  val nack_store = RegInit(false.B)
+
+  last_fired_store_version := Mux(nack_store, nack_store_version, current_fired_store_version)
+
   for (i <- 0 until numStqEntries)
   {
     store_fire_vec(i) :=       ( stq(i).valid                                           &&
@@ -520,8 +516,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                                             stq(i).bits.addr.valid      &&
                                                            !stq(i).bits.addr_is_virtual &&
                                                             stq(i).bits.data.valid)     &&
-                                   !stq(i).bits.fired           &&
-                last_fired_store_version <= stq(i).bits.uop.version))
+                                                           !stq(i).bits.fired           &&
+                                last_fired_store_version <= stq(i).bits.uop.version))
 
     store_fire_vec_nacked(i) := store_fire_vec(i) && ~nacked(i)
     nacked(i) := false.B
@@ -845,10 +841,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq_execute_head          := Mux(dmem_req_fire(w),
                                        WrapInc(stq_execute_head, numStqEntries),
                                                stq_execute_head)
-      //change to store_fire_idx
+
       stq(store_fire_idx).bits.succeeded := false.B
       stq(store_fire_idx).bits.fired     := true.B
-      last_fired_store_version           := stq(store_fire_idx).bits.uop.version
+      current_fired_store_version        := stq(store_fire_idx).bits.uop.version
     } .elsewhen (will_fire_load_wakeup(w)) {
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
@@ -1363,7 +1359,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // update nack idx
         nacked(io.dmem.nack(w).bits.uop.stq_idx) := true.B
         stq(io.dmem.nack(w).bits.uop.stq_idx).bits.fired := false.B
-        last_fired_store_version := stq(io.dmem.nack(w).bits.uop.stq_idx).bits.uop.version  
+        nack_store_version := stq(io.dmem.nack(w).bits.uop.stq_idx).bits.uop.version  
       }
     }
     // Handle the response
@@ -1401,6 +1397,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
           stq(io.dmem.resp(w).bits.uop.stq_idx).bits.debug_wb_data := io.dmem.resp(w).bits.data
         }
+        nack_store := true.B
       }
     }
 
@@ -1471,11 +1468,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       when (IsKilledByBranch(io.core.brupdate, stq(i).bits.uop))
       {
-
         //version restore on branch mispredict
         when(stq(i).bits.uop.is_fence){
           fence_counter := stq(i).bits.uop.version
         }
+
         stq(i).valid           := false.B
         stq(i).bits.addr.valid := false.B
         stq(i).bits.data.valid := false.B
@@ -1517,11 +1514,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   var temp_stq_commit_head = stq_commit_head
   var temp_ldq_head        = ldq_head
-  min_store_version := stq(stq_head).bits.uop.version
   for (w <- 0 until coreWidth)
   {
     val commit_store = io.core.commit.valids(w) && io.core.commit.uops(w).uses_stq
-    val commit_load  = io.core.commit.valids(w) && io.core.commit.uops(w).uses_ldq && ((ldq(temp_ldq_head).bits.uop.version <= min_store_version)|| !stq_nonempty)
+    val commit_load  = io.core.commit.valids(w) && io.core.commit.uops(w).uses_ldq
     val idx = Mux(commit_store, temp_stq_commit_head, temp_ldq_head)
     when (commit_store)
     {
@@ -1719,8 +1715,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   live_store_mask := next_live_store_mask &
                     ~(st_brkilled_mask.asUInt) &
                     ~(st_exc_killed_mask.asUInt)
-
-
 }
 
 /**
